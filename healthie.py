@@ -4,14 +4,18 @@ This module provides functions to interact with Healthie for patient management
 and appointment scheduling.
 """
 
+import calendar
 import os
+import re
+import time
+from datetime import datetime
 
-from playwright.async_api import async_playwright, Browser, Page
 from loguru import logger
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 _browser: Browser | None = None
+_context: BrowserContext | None = None
 _page: Page | None = None
-
 
 async def login_to_healthie() -> Page:
     """Log into Healthie and return an authenticated page instance.
@@ -27,7 +31,7 @@ async def login_to_healthie() -> Page:
         ValueError: If required environment variables are missing.
         Exception: If login fails for any reason.
     """
-    global _browser, _page
+    global _browser, _context, _page
 
     email = os.environ.get("HEALTHIE_EMAIL")
     password = os.environ.get("HEALTHIE_PASSWORD")
@@ -37,40 +41,87 @@ async def login_to_healthie() -> Page:
 
     if _page is not None:
         logger.info("Using existing Healthie session")
-        return _page
+        try:
+            await _page.goto("https://secure.gethealthie.com/clients", wait_until="domcontentloaded")
+            try:
+                await _page.wait_for_load_state("load", timeout=15000)
+            except Exception:
+                pass
+            await _ensure_page_hydrated(_page, timeout_ms=25000, reason="session_clients_not_hydrated")
+            await _wait_until_clients_page_ready(_page, timeout_ms=20000)
+            if "login" not in _page.url and "sign_in" not in _page.url:
+                return _page
+            logger.warning("Existing session is not authenticated anymore, re-authenticating")
+        except Exception:
+            logger.warning("Existing Healthie page is unusable, re-authenticating")
 
     logger.info("Logging into Healthie...")
     playwright = await async_playwright().start()
-    _browser = await playwright.chromium.launch(headless=True)
-    _page = await _browser.new_page()
+    headless = os.environ.get("HEALTHIE_HEADLESS", "false").lower() == "true"
+    _browser = await playwright.chromium.launch(headless=headless)
+    _context = await _browser.new_context()
+    _page = await _context.new_page()
+    _attach_debug_listeners(_page)
 
     await _page.goto("https://secure.gethealthie.com/users/sign_in", wait_until="domcontentloaded")
-    
-    # Wait for the email input to be visible
-    email_input = _page.locator('input[name="email"]')
-    await email_input.wait_for(state="visible", timeout=30000)
+    # Healthie's auth UI is a SPA and can take several seconds to hydrate.
+    # We wait for any likely login field to appear instead of using networkidle.
+    await _wait_for_login_form(_page, timeout_ms=30000)
+    logger.info("Healthie login page loaded: {}", _page.url)
+
+    email_input = await _first_visible_locator(
+        _page,
+        [
+            'input[name="email"]',
+            'input[name="Email"]',
+            'input[type="email"]',
+            'input[id*="email"]',
+            'input[autocomplete="email"]',
+        ],
+        timeout_ms=4000,
+    )
+    if not email_input:
+        await _write_login_debug_artifacts(_page, "email_input_not_found")
+        raise Exception(f"Could not find email input on Healthie login page ({_page.url})")
     await email_input.fill(email)
-    
-    # Wait for password input
-    password_input = _page.locator('input[name="password"]')
-    await password_input.wait_for(state="visible", timeout=30000)
+
+    # Some Healthie/Frontegg tenants use a 2-step login:
+    # email step first, then password appears after continue.
+    password_input = await _get_password_input(_page, timeout_ms=1500)
+    if not password_input:
+        await _submit_email_step(_page)
+        password_input = await _get_password_input(_page, timeout_ms=12000)
+    if not password_input:
+        await _write_login_debug_artifacts(_page, "password_input_not_found")
+        raise Exception(f"Could not find password input on Healthie login page ({_page.url})")
     await password_input.fill(password)
-    
-    # Find and click the Log In button
-    submit_button = _page.locator('button:has-text("Log In")')
-    await submit_button.wait_for(state="visible", timeout=30000)
+
+    submit_button = await _first_visible_locator(
+        _page,
+        [
+            'button:has-text("Log In")',
+            'button:has-text("Sign In")',
+            'button[type="submit"]',
+            'input[type="submit"]',
+            '[role="button"]:has-text("Log In")',
+        ],
+        timeout_ms=4000,
+    )
+    if not submit_button:
+        await _write_login_debug_artifacts(_page, "submit_button_not_found")
+        raise Exception(f"Could not find login submit button ({_page.url})")
     await submit_button.click()
-    
-    # Wait for navigation after login
-    await _page.wait_for_timeout(3000)
-    
-    # Check if we've navigated away from the sign-in page
+
+    await _page.wait_for_timeout(3500)
+    await _page.wait_for_load_state("domcontentloaded")
     current_url = _page.url
-    if "sign_in" in current_url:
-        raise Exception("Login may have failed - still on sign-in page")
+    if "login" in current_url or "sign_in" in current_url:
+        await _write_login_debug_artifacts(_page, "still_on_login_page")
+        raise Exception(f"Login may have failed; still on auth page ({current_url})")
 
     logger.info("Successfully logged into Healthie")
     return _page
+
 
 
 async def find_patient(name: str, date_of_birth: str) -> dict | None:
@@ -93,22 +144,609 @@ async def find_patient(name: str, date_of_birth: str) -> dict | None:
             ...
         }
     """
-    # TODO: Implement patient search functionality using Playwright
-    # 1. Ensure you're logged in by calling login_to_healthie()
-    # 2. Enter the patient's name and date of birth into the search field
-    # 3. Submit the search
-    # 4. Parse the results and return patient information
-    # 5. Handle cases where the patient is not found
-    pass
+    page = await login_to_healthie()
+    normalized_name = " ".join(name.strip().split())
+    normalized_dob = _normalize_date(date_of_birth)
+    dob_variants = _date_variants(normalized_dob or date_of_birth)
+
+    try:
+        search_selectors = [
+            'input[placeholder*="Search"]',
+            'input[aria-label*="Search"]',
+            'input[name*="search"]',
+            "input[type='search']",
+            "[role='searchbox']",
+            "input[data-testid*='search']",
+        ]
+        await page.goto("https://secure.gethealthie.com/clients", wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("load", timeout=15000)
+        except Exception:
+            pass
+        await _ensure_page_hydrated(page, timeout_ms=30000, reason="clients_page_not_hydrated")
+        await _wait_until_clients_page_ready(page, timeout_ms=25000)
+        search_input = await _wait_for_clients_search_input(page, search_selectors)
+        if search_input:
+            logger.info("Found patient search input on {}", page.url)
+
+        if not search_input:
+            await _log_visible_clients(page)
+            await _write_login_debug_artifacts(page, "patient_search_input_not_found")
+            logger.error("Could not locate patient search input on {}", page.url)
+            return None
+
+        await _submit_clients_list_search(page, search_input, normalized_name)
+        await _wait_for_client_results(page, timeout_ms=25000, patient_name=normalized_name)
+
+        candidates = await _collect_client_candidates(page, normalized_name)
+        if len(candidates) < 1:
+            logger.info("No client profile links after primary search; retrying with keystroke entry")
+            await _fallback_search_by_keystrokes(page, search_input, normalized_name)
+            await _wait_for_client_results(page, timeout_ms=20000, patient_name=normalized_name)
+            candidates = await _collect_client_candidates(page, normalized_name)
+
+        if len(candidates) < 1:
+            await _log_visible_clients(page)
+            await _write_login_debug_artifacts(page, "client_rows_not_found_after_search")
+            logger.info("No patient rows found for name '{}'", normalized_name)
+            return None
+
+        candidates = _filter_candidates_by_name(candidates, normalized_name)
+        candidates = _sort_candidates_by_match(candidates, normalized_name, dob_variants)
+        logger.debug("Client profile candidates after search: {}", candidates)
+
+        sole_list_match = (
+            len(candidates) == 1
+            and (candidates[0].get("text") or "").strip().lower() == normalized_name.lower()
+            and bool(normalized_dob)
+        )
+
+        for cand in candidates[:10]:
+            patient_id = cand["id"]
+            href = cand.get("href") or ""
+            text = (cand.get("text") or "").strip()
+            profile_urls = list(
+                dict.fromkeys(
+                    [
+                        _absolute_healthie_href(href),
+                        f"https://secure.gethealthie.com/clients/{patient_id}",
+                    ]
+                )
+            )
+
+            body = ""
+            for purl in profile_urls:
+                await page.goto(purl, wait_until="domcontentloaded")
+                try:
+                    await page.wait_for_load_state("load", timeout=12000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
+                page_text = await page.inner_text("body")
+                body = _profile_body_normalized(page_text)
+                logger.debug(
+                    "Evaluating client candidate '{}' ({}) on {} (DOB variants + flex)",
+                    text or normalized_name,
+                    patient_id,
+                    purl,
+                )
+                if _dob_matches_profile_body(body, dob_variants, normalized_dob):
+                    logger.info("Found matching patient '{}' ({})", text or normalized_name, patient_id)
+                    return {
+                        "patient_id": patient_id,
+                        "name": text or normalized_name,
+                        "date_of_birth": normalized_dob or date_of_birth,
+                    }
+
+            if text.lower() == normalized_name.lower() and not normalized_dob:
+                logger.info("Found patient by name-only '{}' ({})", text, patient_id)
+                return {
+                    "patient_id": patient_id,
+                    "name": text,
+                    "date_of_birth": date_of_birth,
+                }
+
+            if sole_list_match and text.lower().strip() == normalized_name.lower():
+                logger.warning(
+                    "DOB not visible on profile pages for sole search match '{}'; accepting id {}",
+                    normalized_name,
+                    patient_id,
+                )
+                return {
+                    "patient_id": patient_id,
+                    "name": text or normalized_name,
+                    "date_of_birth": normalized_dob or date_of_birth,
+                }
+
+        logger.info("Patient '{}' not found with DOB '{}'", normalized_name, normalized_dob)
+        return None
+    except Exception as exc:
+        logger.exception("Failed to find patient: {}", exc)
+        return None
 
 
-async def create_appointment(patient_id: str, date: str, time: str) -> dict | None:
+async def _open_book_session_modal(page: Page, patient_id: str) -> bool:
+    """Click Book session for this client (do not use /appointments/new — Healthie treats 'new' as search text)."""
+    scoped = page.locator(f'[data-testid="book-session-with-{patient_id}"]')
+    deadline = time.monotonic() + 40.0
+    while time.monotonic() < deadline:
+        try:
+            first = scoped.first
+            if await first.is_visible(timeout=1200):
+                await first.scroll_into_view_if_needed()
+                await first.click()
+                return True
+        except Exception:
+            pass
+        btn = await _first_visible_locator(
+            page,
+            [
+                'button:has-text("Book session")',
+                'button:has-text("Book Session")',
+                'button:has-text("Create appointment")',
+                'button:has-text("Create Appointment")',
+            ],
+            timeout_ms=1200,
+        )
+        if btn:
+            await btn.scroll_into_view_if_needed()
+            await btn.click()
+            return True
+        await page.wait_for_timeout(450)
+    return False
+
+
+HEALTHIE_OPTION_INITIAL = "Initial Consultation - 60 Minutes"
+HEALTHIE_OPTION_FOLLOW_UP = "Follow-up Session - 45 Minutes"
+
+
+def _healthie_booking_type_option_label(appointment_type: str | None) -> str:
+    """Map caller intent to the exact Healthie dropdown label."""
+    if not appointment_type or not str(appointment_type).strip():
+        return HEALTHIE_OPTION_INITIAL
+    t = str(appointment_type).strip().lower()
+    if "follow" in t or "45" in t:
+        return HEALTHIE_OPTION_FOLLOW_UP
+    if "initial" in t or "consult" in t or "60" in t:
+        return HEALTHIE_OPTION_INITIAL
+    if t in ("follow_up", "followup", "follow-up"):
+        return HEALTHIE_OPTION_FOLLOW_UP
+    if t in ("initial_consultation", "initial", "consultation"):
+        return HEALTHIE_OPTION_INITIAL
+    return HEALTHIE_OPTION_INITIAL
+
+
+async def _select_healthie_appointment_type(page: Page, modal, appointment_type: str | None) -> bool:
+    """Open **Appointment type** and pick Initial (60m) or Follow-up (45m). Required before submit."""
+    desired = _healthie_booking_type_option_label(appointment_type)
+    combo = modal.get_by_role("combobox", name=re.compile(r"appointment\s*type", re.I)).first
+    try:
+        if not await combo.is_visible(timeout=3000):
+            combo = None
+    except Exception:
+        combo = None
+
+    if combo is None:
+        n = await modal.get_by_role("combobox").count()
+        for i in range(n):
+            el = modal.get_by_role("combobox").nth(i)
+            try:
+                aria = (await el.get_attribute("aria-label")) or ""
+                name = (await el.get_attribute("name")) or ""
+                blob = f"{aria} {name}".lower()
+                if "appointment" in blob and "type" in blob:
+                    combo = el
+                    break
+            except Exception:
+                continue
+
+    if combo is None:
+        n = await modal.get_by_role("combobox").count()
+        for i in range(n):
+            el = modal.get_by_role("combobox").nth(i)
+            try:
+                inner = (await el.inner_text()).strip().lower()
+                if "select" not in inner:
+                    continue
+                if "time" in inner or "zone" in inner:
+                    continue
+                combo = el
+                break
+            except Exception:
+                continue
+
+    if combo is None:
+        return False
+
+    try:
+        await combo.scroll_into_view_if_needed()
+        await combo.click(timeout=5000)
+        await page.wait_for_timeout(450)
+        listbox = page.get_by_role("listbox").last
+        opt = listbox.get_by_role("option", name=re.compile(re.escape(desired), re.I))
+        await opt.click(timeout=6000)
+        await page.wait_for_timeout(500)
+        return True
+    except Exception:
+        pass
+
+    try:
+        await combo.click(timeout=3000)
+        await page.wait_for_timeout(400)
+        opt = page.get_by_role("option", name=re.compile(re.escape(desired), re.I)).first
+        await opt.click(timeout=6000)
+        await page.wait_for_timeout(500)
+        return True
+    except Exception:
+        return False
+
+
+async def _fill_modal_field(modal, locator, value: str, *, force: bool = False) -> bool:
+    try:
+        if await locator.is_visible(timeout=2000):
+            await locator.click(force=force)
+            await locator.fill("", force=force)
+            await locator.fill(value, force=force)
+            await locator.evaluate(
+                """el => {
+                  el.dispatchEvent(new Event("input", { bubbles: true }));
+                  el.dispatchEvent(new Event("change", { bubbles: true }));
+                }"""
+            )
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _dismiss_healthie_datepicker_overlays(page: Page) -> None:
+    """Close react-datepicker poppers (date + time) so the next field is actionable."""
+    for _ in range(6):
+        pop = page.locator(".react-datepicker-popper").first
+        try:
+            visible = await pop.is_visible(timeout=120)
+        except Exception:
+            visible = False
+        if not visible:
+            return
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(220)
+
+
+async def _fill_healthie_booking_datetime(modal, page: Page, display_date: str, time: str) -> tuple[bool, bool]:
+    """Fill Healthie book-session modal date/time (react-datepicker; time input has broken aria-labelledby)."""
+    date_loc = modal.locator("input#date, input[name='date']").first
+    time_loc = modal.locator("input#time, input[name='time']").first
+
+    filled_date = False
+    try:
+        await date_loc.wait_for(state="visible", timeout=10000)
+        await date_loc.click(timeout=5000)
+        await date_loc.fill("")
+        await date_loc.fill(display_date)
+        await date_loc.evaluate(
+            """el => {
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+            }"""
+        )
+        filled_date = True
+    except Exception:
+        pass
+
+    await _dismiss_healthie_datepicker_overlays(page)
+    await page.wait_for_timeout(350)
+
+    filled_time = False
+    try:
+        await time_loc.wait_for(state="visible", timeout=10000)
+        await time_loc.click(timeout=5000, force=True)
+        await time_loc.fill("", force=True)
+        await time_loc.fill(time, force=True)
+        await time_loc.evaluate(
+            """el => {
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+            }"""
+        )
+        filled_time = True
+    except Exception:
+        pass
+
+    return filled_date, filled_time
+
+
+async def _scroll_healthie_booking_modal_to_bottom(modal) -> None:
+    """Scroll modal shell so **Add appointment** (often below the fold) is reachable."""
+    try:
+        await modal.evaluate("""(root) => {
+          const scrollables = [root, ...root.querySelectorAll('*')].filter(
+            (el) => {
+              const s = window.getComputedStyle(el);
+              return (s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight;
+            }
+          );
+          for (const el of scrollables) {
+            try { el.scrollTop = el.scrollHeight; } catch (e) {}
+          }
+          const form = root.querySelector('form');
+          if (form) try { form.scrollTop = form.scrollHeight; } catch (e) {}
+        }""")
+    except Exception:
+        pass
+
+
+_ADD_APPOINTMENT_DOUBLE_GAP_MS = 480
+
+
+async def _click_add_appointment_via_dom(page: Page) -> bool:
+    """Activate **Add appointment** purely in the page DOM (no Playwright hit-testing).
+
+    Healthie's React handler sometimes misses a single ``.click()``; this path scrolls the
+    node, fires pointer/mouse events at the element center, calls ``click()``, and uses
+    ``form.requestSubmit(button)`` when available.
+
+    Fires **twice** with a short gap: the first interaction can commit time-field formatting;
+    the second performs submit.
+    """
+    try:
+        _gap = str(_ADD_APPOINTMENT_DOUBLE_GAP_MS)
+        _dom_script = """
+            async () => {
+              const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
+
+              function roots() {
+                const ids = ["modal-content", "modal", "modal-section"];
+                const out = [];
+                for (const id of ids) {
+                  const el = document.getElementById(id);
+                  if (el) out.push(el);
+                }
+                for (const sel of [
+                  '[data-testid="modal-content"]',
+                  '[data-testid="modal"]',
+                  ".client-book-session-modal",
+                ]) {
+                  document.querySelectorAll(sel).forEach((n) => out.push(n));
+                }
+                out.push(document.body);
+                return out;
+              }
+
+              function findButton() {
+                const direct = document.querySelector(
+                  '.client-book-session-modal [data-testid="primaryButton"],'
+                  + ' #modal-content [data-testid="primaryButton"],'
+                  + ' #modal [data-testid="primaryButton"]'
+                );
+                if (
+                  direct &&
+                  String(direct.tagName).toUpperCase() === "BUTTON" &&
+                  !direct.disabled
+                ) {
+                  return direct;
+                }
+                for (const root of roots()) {
+                  const b = root.querySelector('[data-testid="primaryButton"]');
+                  if (b && String(b.tagName).toUpperCase() === "BUTTON" && !b.disabled) return b;
+                }
+                const buttons = Array.from(document.querySelectorAll("button"));
+                for (const b of buttons) {
+                  const t = norm(b.innerText) || norm(b.textContent);
+                  if (
+                    t === "add appointment" ||
+                    /^add\\s+appointment$/i.test(t) ||
+                    t.indexOf("add appointment") >= 0
+                  ) {
+                    return b;
+                  }
+                }
+                return null;
+              }
+
+              function fire(el) {
+                el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+                const r = el.getBoundingClientRect();
+                const x = r.left + Math.min(r.width / 2, 80);
+                const y = r.top + Math.min(r.height / 2, 40);
+                const base = {
+                  bubbles: true,
+                  cancelable: true,
+                  clientX: x,
+                  clientY: y,
+                  view: window,
+                };
+                try {
+                  el.dispatchEvent(
+                    new PointerEvent("pointerdown", {
+                      ...base,
+                      pointerId: 1,
+                      pointerType: "mouse",
+                      isPrimary: true,
+                    })
+                  );
+                } catch (e) {}
+                el.dispatchEvent(new MouseEvent("mousedown", base));
+                try {
+                  el.dispatchEvent(
+                    new PointerEvent("pointerup", {
+                      ...base,
+                      pointerId: 1,
+                      pointerType: "mouse",
+                      isPrimary: true,
+                    })
+                  );
+                } catch (e) {}
+                el.dispatchEvent(new MouseEvent("mouseup", base));
+                el.dispatchEvent(new MouseEvent("click", base));
+                if (typeof el.click === "function") el.click();
+              }
+
+              const btn = findButton();
+              if (!btn) return { ok: false, reason: "no_button" };
+              if (btn.disabled) return { ok: false, reason: "disabled" };
+              const gap = __GAP_MS__;
+              fire(btn);
+              await new Promise((r) => setTimeout(r, gap));
+              fire(btn);
+              const form = btn.closest("form");
+              if (form && typeof form.requestSubmit === "function") {
+                try {
+                  form.requestSubmit(btn);
+                } catch (e) {}
+              }
+              return { ok: true, tag: String(btn.tagName) };
+            }
+        """
+        result = await page.evaluate(_dom_script.strip().replace("__GAP_MS__", _gap))
+        if isinstance(result, dict) and result.get("ok"):
+            return True
+        if isinstance(result, dict) and result.get("reason"):
+            logger.warning("DOM Add appointment did not run: {}", result.get("reason"))
+        return False
+    except Exception:
+        return False
+
+
+async def _click_healthie_modal_submit(modal, page: Page) -> bool:
+    """Click **Add appointment** (`primaryButton`).
+
+    Uses **in-page DOM** activation (synthetic events + ``requestSubmit``), then Playwright,
+    then a second DOM pass after scrolling again.
+    """
+    await _scroll_healthie_booking_modal_to_bottom(modal)
+    await page.wait_for_timeout(200)
+
+    await _click_add_appointment_via_dom(page)
+    await page.wait_for_timeout(250)
+
+    candidates = [
+        page.locator('[data-testid="modal"] [data-testid="primaryButton"]').first,
+        page.locator('[data-testid="modal-content"] [data-testid="primaryButton"]').first,
+        modal.get_by_test_id("primaryButton").first,
+        modal.locator('button[data-testid="primaryButton"]').first,
+        modal.get_by_role("button", name=re.compile(r"add\s*appointment", re.I)).first,
+        modal.locator('button:has-text("Add appointment")').first,
+        page.locator(".client-book-session-modal button[data-testid='primaryButton']").first,
+    ]
+
+    async def _try_playwright_click(loc) -> bool:
+        try:
+            await loc.wait_for(state="attached", timeout=6000)
+        except Exception:
+            return False
+        try:
+            await loc.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(120)
+        try:
+            await loc.click(timeout=15000, force=True)
+            await page.wait_for_timeout(_ADD_APPOINTMENT_DOUBLE_GAP_MS)
+            await loc.click(timeout=15000, force=True)
+            return True
+        except Exception:
+            pass
+        try:
+            handle = await loc.element_handle()
+            if handle:
+                _h = """async (el) => {
+                      const go = () => {
+                        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+                        el.click();
+                      };
+                      const gap = __GAP_MS__;
+                      go();
+                      await new Promise((r) => setTimeout(r, gap));
+                      go();
+                    }"""
+                await handle.evaluate(_h.replace("__GAP_MS__", str(_ADD_APPOINTMENT_DOUBLE_GAP_MS)))
+                return True
+        except Exception:
+            pass
+        return False
+
+    for loc in candidates:
+        if await _try_playwright_click(loc):
+            return True
+
+    _legacy_click = """
+            async () => {
+              const btn = document.querySelector(
+                '[data-testid="modal-content"] [data-testid="primaryButton"],'
+                + ' [data-testid="modal"] [data-testid="primaryButton"]'
+              );
+              if (!btn || btn.disabled) return false;
+              const gap = __GAP_MS__;
+              const once = () => {
+                btn.scrollIntoView({ block: 'center', behavior: 'instant' });
+                btn.click();
+              };
+              once();
+              await new Promise((r) => setTimeout(r, gap));
+              once();
+              return true;
+            }
+        """
+    try:
+        ok = await page.evaluate(
+            _legacy_click.strip().replace("__GAP_MS__", str(_ADD_APPOINTMENT_DOUBLE_GAP_MS))
+        )
+        if ok:
+            return True
+    except Exception:
+        pass
+
+    try:
+        ok = await modal.evaluate(
+            (
+                """async (root) => {
+              const btn = root.querySelector('[data-testid="primaryButton"]');
+              if (!btn || btn.disabled) return false;
+              const gap = __GAP_MS__;
+              const once = () => {
+                btn.scrollIntoView({ block: 'center', behavior: 'instant' });
+                btn.click();
+              };
+              once();
+              await new Promise((r) => setTimeout(r, gap));
+              once();
+              return true;
+            }"""
+            ).replace("__GAP_MS__", str(_ADD_APPOINTMENT_DOUBLE_GAP_MS))
+        )
+        if ok:
+            return True
+    except Exception:
+        pass
+
+    await _scroll_healthie_booking_modal_to_bottom(modal)
+    await page.wait_for_timeout(200)
+    if await _click_add_appointment_via_dom(page):
+        await page.wait_for_timeout(300)
+        return True
+
+    return False
+
+
+async def create_appointment(
+    patient_id: str,
+    date: str,
+    time: str,
+    appointment_type: str | None = None,
+) -> dict | None:
     """Create an appointment in Healthie for the specified patient.
+
+    Opens the **Book session** modal from the client page. Navigating to
+    ``/clients/{id}/appointments/new`` is avoided: the SPA treats ``new`` as a
+    client search keyword and shows an empty list.
 
     Args:
         patient_id: The unique identifier for the patient in Healthie.
         date: The desired appointment date in a format that Healthie accepts.
         time: The desired appointment time in a format that Healthie accepts.
+        appointment_type: ``initial_consultation`` / ``follow_up`` (or phrases like
+            "initial consultation"); selects the matching Healthie visit type.
 
     Returns:
         dict | None: A dictionary containing appointment information if created
@@ -124,12 +762,863 @@ async def create_appointment(patient_id: str, date: str, time: str) -> dict | No
             ...
         }
     """
-    # TODO: Implement appointment creation functionality using Playwright
-    # 1. Ensure you're logged in by calling login_to_healthie()
-    # 2. Navigate to the appointment creation page for the patient
-    # 3. Fill in the date and time fields
-    # 4. Submit the appointment creation form
-    # 5. Verify the appointment was created successfully
-    # 6. Return appointment information
-    # 7. Handle errors (e.g., time slot unavailable, invalid date/time)
-    pass
+    page = await login_to_healthie()
+    normalized_date = _normalize_date(date)
+    display_date = _healthie_modal_date_display(normalized_date, date)
+
+    try:
+        await page.goto(
+            f"https://secure.gethealthie.com/clients/{patient_id}",
+            wait_until="domcontentloaded",
+        )
+        try:
+            await page.wait_for_load_state("load", timeout=20000)
+        except Exception:
+            pass
+        await _ensure_page_hydrated(page, timeout_ms=25000, reason="appointment_client_not_hydrated")
+        # #root can contain only the spinner; _ensure_page_hydrated returns too early. Wait it out.
+        try:
+            await _wait_until_clients_page_ready(page, timeout_ms=45000)
+        except Exception as exc:
+            logger.warning("Loading overlay wait on client profile: {}", exc)
+        await page.wait_for_timeout(800)
+
+        if not await _open_book_session_modal(page, patient_id):
+            await _write_login_debug_artifacts(page, "appointment_book_button_not_found")
+            logger.error("Could not open Book session for patient {}", patient_id)
+            return None
+
+        modal = page.locator('[data-testid="modal-content"]').first
+        try:
+            await modal.wait_for(state="visible", timeout=15000)
+        except Exception:
+            modal = page.locator('[role="dialog"]').first
+            try:
+                await modal.wait_for(state="visible", timeout=8000)
+            except Exception:
+                await _write_login_debug_artifacts(page, "appointment_modal_not_visible")
+                logger.error("Booking modal did not appear")
+                return None
+
+        if not await _select_healthie_appointment_type(page, modal, appointment_type):
+            logger.error("Could not set Appointment type in booking modal")
+            await _write_login_debug_artifacts(page, "appointment_type_not_selected")
+            return None
+
+        filled_date, filled_time = await _fill_healthie_booking_datetime(modal, page, display_date, time)
+
+        if not filled_date:
+            for label in (
+                re.compile(r"start\s*date", re.I),
+                re.compile(r"fecha\s*de\s*inicio", re.I),
+            ):
+                if await _fill_modal_field(
+                    modal,
+                    modal.get_by_role("textbox", name=label).first,
+                    display_date,
+                ):
+                    filled_date = True
+                    break
+        if not filled_date:
+            for sel in (
+                'input[placeholder*="Start date"]',
+                'input[placeholder*="start date"]',
+                'input[placeholder*="Date"]',
+            ):
+                loc = modal.locator(sel).first
+                if await _fill_modal_field(modal, loc, display_date):
+                    filled_date = True
+                    break
+
+        if not filled_time:
+            await _dismiss_healthie_datepicker_overlays(page)
+            await page.wait_for_timeout(200)
+            for label in (
+                re.compile(r"start\s*time", re.I),
+                re.compile(r"hora\s*de\s*inicio", re.I),
+            ):
+                if await _fill_modal_field(
+                    modal,
+                    modal.get_by_role("textbox", name=label).first,
+                    time,
+                    force=True,
+                ):
+                    filled_time = True
+                    break
+        if not filled_time:
+            for sel in (
+                'input[placeholder*="Start time"]',
+                'input[placeholder*="start time"]',
+                'input[placeholder*="Time"]',
+                'input[placeholder*="Select a time"]',
+            ):
+                loc = modal.locator(sel).first
+                if await _fill_modal_field(modal, loc, time, force=True):
+                    filled_time = True
+                    break
+
+        if not filled_date or not filled_time:
+            await _write_login_debug_artifacts(page, "appointment_modal_fields_not_found")
+            logger.error("Could not fill booking modal date/time fields")
+            return None
+
+        await _dismiss_healthie_datepicker_overlays(page)
+        await page.wait_for_timeout(500)
+
+        if not await _click_healthie_modal_submit(modal, page):
+            await _scroll_healthie_booking_modal_to_bottom(modal)
+            clicked = False
+            for txt in ("Add appointment", "Schedule", "Save", "Create", "Confirm", "Book"):
+                loc = modal.locator(f'button:has-text("{txt}")').first
+                try:
+                    await loc.wait_for(state="attached", timeout=2000)
+                    await loc.scroll_into_view_if_needed()
+                    try:
+                        await loc.click(timeout=8000, force=True)
+                        if txt == "Add appointment":
+                            await page.wait_for_timeout(_ADD_APPOINTMENT_DOUBLE_GAP_MS)
+                            await loc.click(timeout=8000, force=True)
+                        clicked = True
+                    except Exception:
+                        h = await loc.element_handle()
+                        if h:
+                            _fh = """async (el) => {
+                              const go = () => {
+                                el.scrollIntoView({ block: 'center', behavior: 'instant' });
+                                el.click();
+                              };
+                              const gap = __GAP_MS__;
+                              go();
+                              await new Promise((r) => setTimeout(r, gap));
+                              if (__DOUBLE__) { go(); }
+                            }"""
+                            await h.evaluate(
+                                _fh.strip()
+                                .replace("__GAP_MS__", str(_ADD_APPOINTMENT_DOUBLE_GAP_MS))
+                                .replace(
+                                    "__DOUBLE__",
+                                    "true" if txt == "Add appointment" else "false",
+                                )
+                            )
+                            clicked = True
+                    if clicked:
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                await _write_login_debug_artifacts(page, "appointment_submit_not_found")
+                logger.error("Could not click Add appointment / submit in booking modal")
+                return None
+
+        await page.wait_for_timeout(2500)
+
+        current_url = page.url
+        appointment_id = None
+        if "/appointments/" in current_url:
+            appointment_id = current_url.rstrip("/").split("/")[-1]
+
+        body = (await page.inner_text("body")).lower()
+        if any(
+            success in body
+            for success in (
+                "appointment",
+                "scheduled",
+                "success",
+                "created",
+                "confirmed",
+                "cita",
+            )
+        ):
+            logger.info("Appointment created for patient {}", patient_id)
+            return {
+                "appointment_id": appointment_id or "unknown",
+                "patient_id": patient_id,
+                "date": normalized_date or date,
+                "time": time,
+                "status": "scheduled",
+            }
+
+        await _write_login_debug_artifacts(page, "appointment_verify_failed")
+        logger.error("Could not verify appointment creation")
+        return None
+    except Exception as exc:
+        logger.exception("Failed to create appointment: {}", exc)
+        return None
+
+
+def _normalize_date(raw: str) -> str:
+    """Normalize date strings to YYYY-MM-DD when possible."""
+    value = raw.strip()
+    if not value:
+        return value
+
+    fmts = ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%B %d %Y", "%b %d %Y")
+    for fmt in fmts:
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return value
+
+
+def _healthie_modal_date_display(normalized_iso: str | None, raw: str) -> str:
+    """Format date like 'April 26, 2026' for Healthie booking modal fields."""
+    for cand in (normalized_iso, _normalize_date(raw), raw.strip()):
+        if not cand:
+            continue
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%B %d, %Y", "%b %d, %Y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(cand, fmt).strftime("%B %d, %Y")
+            except ValueError:
+                continue
+    return raw.strip()
+
+
+def _date_variants(raw: str) -> list[str]:
+    """Generate common DOB textual variants for on-page matching."""
+    normalized = _normalize_date(raw)
+    variants = {normalized.lower(), raw.strip().lower()}
+    try:
+        parsed = datetime.strptime(normalized, "%Y-%m-%d")
+        variants.update(
+            {
+                parsed.strftime("%Y-%m-%d").lower(),
+                parsed.strftime("%m/%d/%Y").lower(),
+                parsed.strftime("%m-%d-%Y").lower(),
+                f"{parsed.month}/{parsed.day}/{parsed.year}".lower(),
+                parsed.strftime("%d/%m/%Y").lower(),
+                parsed.strftime("%d-%m-%Y").lower(),
+                parsed.strftime("%B %d, %Y").lower(),
+                parsed.strftime("%b %d, %Y").lower(),
+                parsed.strftime("%d %B %Y").lower(),
+                parsed.strftime("%d %b %Y").lower(),
+            }
+        )
+        sm = calendar.month_name[parsed.month].lower()
+        sa = calendar.month_abbr[parsed.month].lower()
+        variants.add(f"{parsed.day} {sm} {parsed.year}".lower())
+        variants.add(f"{parsed.day} {sa} {parsed.year}".lower())
+        # Spanish UI (Healthie may render es-* locale)
+        es_months = (
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        )
+        em = es_months[parsed.month - 1]
+        variants.add(f"{parsed.day} de {em} de {parsed.year}".lower())
+        variants.add(f"{parsed.day} de {em}".lower())
+    except ValueError:
+        pass
+    return [v for v in variants if v]
+
+
+def _profile_body_normalized(raw: str) -> str:
+    t = raw.lower().replace("\u00a0", " ").replace("\u2019", "'").replace("\u2018", "'")
+    return " ".join(t.split())
+
+
+def _dob_matches_profile_body(body: str, dob_variants: list[str], normalized_iso: str | None) -> bool:
+    """True if DOB appears in profile text (substring, flexible m/d/y, or digit patterns)."""
+    if any(v and v in body for v in dob_variants):
+        return True
+    if not normalized_iso:
+        return False
+    try:
+        dt = datetime.strptime(normalized_iso, "%Y-%m-%d")
+    except ValueError:
+        return False
+    y, m, d = dt.year, dt.month, dt.day
+    if str(y) not in body:
+        return False
+    patterns = (
+        rf"\b0*{m}[-/.]0*{d}[-/.]{y}\b",
+        rf"\b0*{d}[-/.]0*{m}[-/.]{y}\b",
+        rf"\b{y}[-/.]0*{m:02d}[-/.]0*{d:02d}\b",
+        rf"\b{y}[-/.]0*{m}[-/.]0*{d}\b",
+    )
+    return any(re.search(p, body) for p in patterns)
+
+
+def _extract_client_id(href: str) -> str | None:
+    """Extract numeric id from Healthie profile URLs (/clients/ or /users/ on clients list)."""
+    if not href:
+        return None
+    cleaned = href.replace("https://secure.gethealthie.com", "").replace("https://app.gethealthie.com", "")
+    for pattern in (
+        r"/clients/(\d+)(?:$|[/?#\"'&])",
+        r"/users/(\d+)(?:$|[/?#\"'&])",
+    ):
+        match = re.search(pattern, cleaned, re.I)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _extract_client_ids_from_html(html: str) -> list[str]:
+    """Find numeric ids in row markup: /clients/, /users/, user_id-*, book-session-with-*."""
+    h = html or ""
+    ids: list[str] = []
+    ids += re.findall(r"/(?:clients|users)/(\d+)(?:[\"'/?#&\s]|$)", h, flags=re.I)
+    ids += re.findall(r"user_id-(\d+)", h, flags=re.I)
+    ids += re.findall(r"book-session-with-(\d+)", h, flags=re.I)
+    return list(dict.fromkeys(ids))
+
+
+async def _candidates_from_table_row_for_name(page: Page, patient_name: str) -> list[dict]:
+    """Read profile id from the filtered table row (Healthie uses /users/<id> on client-link anchors)."""
+    row = page.get_by_role("row").filter(has_text=patient_name).filter(has_text="Book session").first
+    try:
+        await row.wait_for(state="visible", timeout=6000)
+    except Exception:
+        row = page.get_by_role("row").filter(has_text=patient_name).first
+        try:
+            await row.wait_for(state="visible", timeout=4000)
+        except Exception:
+            return []
+
+    try:
+        ctx = (await row.inner_text())[:500]
+    except Exception:
+        ctx = ""
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    try:
+        n = await row.locator("a[href]").count()
+        for i in range(n):
+            href = await row.locator("a[href]").nth(i).get_attribute("href") or ""
+            pid = _extract_client_id(href)
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            text = (await row.locator("a[href]").nth(i).inner_text()).strip()
+            out.append(
+                {
+                    "id": pid,
+                    "href": href,
+                    "text": text or patient_name,
+                    "context": ctx,
+                }
+            )
+    except Exception:
+        pass
+
+    if not out:
+        try:
+            html = await row.evaluate("el => el.innerHTML")
+            for pid in _extract_client_ids_from_html(html):
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                href = f"/users/{pid}" if f"/users/{pid}" in html else f"/clients/{pid}"
+                out.append(
+                    {
+                        "id": pid,
+                        "href": href,
+                        "text": patient_name,
+                        "context": ctx,
+                    }
+                )
+        except Exception:
+            pass
+
+    return out
+
+
+async def _collect_client_candidates(page: Page, patient_name: str) -> list[dict]:
+    """Merge global link scan with table-row extraction (filtered list often only has row-local markup)."""
+    from_dom = await _client_profile_candidates_from_dom(page)
+    from_row = await _candidates_from_table_row_for_name(page, patient_name)
+    merged: dict[str, dict] = {}
+    for c in from_dom + from_row:
+        pid = c.get("id")
+        if not pid:
+            continue
+        if pid not in merged or len((c.get("context") or "")) > len((merged[pid].get("context") or "")):
+            merged[pid] = c
+    return list(merged.values())
+
+
+async def _client_profile_candidates_from_dom(page: Page) -> list[dict]:
+    """Collect profile links for numeric ids (/clients/ and /users/ — Healthie lists use /users/).
+
+    Autocomplete View Profile links may still use /clients/; table name links often use /users/.
+    """
+    return await page.evaluate(
+        r"""
+        () => {
+          const re = /\/(clients|users)\/(\d+)(?:$|[?#/])/i;
+          const out = [];
+          const seen = new Set();
+          for (const el of document.querySelectorAll('a[href]')) {
+            const raw = el.getAttribute('href') || '';
+            if (!raw.includes('/clients/') && !raw.includes('/users/')) continue;
+            const abs = raw.startsWith('http') ? raw : (window.location.origin + (raw.startsWith('/') ? raw : '/' + raw));
+            const m = abs.match(re);
+            if (!m) continue;
+            const id = m[2];
+            if (seen.has(id)) continue;
+            seen.add(id);
+            let ctx = '';
+            let p = el;
+            for (let i = 0; i < 8 && p; i++) {
+              ctx = (p.innerText || '').trim() + '\n' + ctx;
+              p = p.parentElement;
+            }
+            out.push({
+              id,
+              href: raw,
+              text: (el.innerText || '').trim().slice(0, 200),
+              context: ctx.slice(0, 500),
+            });
+          }
+          return out;
+        }
+        """
+    )
+
+
+def _absolute_healthie_href(href: str) -> str:
+    if href.startswith("http"):
+        return href
+    path = href if href.startswith("/") else f"/{href}"
+    return f"https://secure.gethealthie.com{path}"
+
+
+async def _first_visible_locator(page: Page, selectors: list[str], timeout_ms: int = 1500):
+    """Return the first visible locator from a list of selector candidates."""
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            if await locator.is_visible(timeout=timeout_ms):
+                return locator
+        except Exception:
+            continue
+    return None
+
+
+async def _get_password_input(page: Page, timeout_ms: int = 4000):
+    """Find a visible password field on the current page."""
+    return await _first_visible_locator(
+        page,
+        [
+            'input[name="password"]',
+            'input[type="password"]',
+            'input[id*="password"]',
+            'input[autocomplete="current-password"]',
+        ],
+        timeout_ms=timeout_ms,
+    )
+
+
+async def _submit_email_step(page: Page) -> None:
+    """Advance 2-step login flows where password appears after email submission."""
+    continue_button = await _first_visible_locator(
+        page,
+        [
+            'button:has-text("Continue")',
+            'button:has-text("Next")',
+            'button:has-text("Log In")',
+            'button:has-text("Sign In")',
+            'button[type="submit"]',
+            'input[type="submit"]',
+            '[role="button"]:has-text("Continue")',
+            '[role="button"]:has-text("Next")',
+        ],
+        timeout_ms=2000,
+    )
+    if continue_button:
+        await continue_button.click()
+    else:
+        # Fallback for forms that submit on Enter from email field.
+        email_input = await _first_visible_locator(
+            page,
+            [
+                'input[name="email"]',
+                'input[name="Email"]',
+                'input[type="email"]',
+                'input[id*="email"]',
+                'input[autocomplete="email"]',
+            ],
+            timeout_ms=1000,
+        )
+        if email_input:
+            await email_input.press("Enter")
+
+    await page.wait_for_timeout(700)
+
+
+async def _wait_for_login_form(page: Page, timeout_ms: int = 30000) -> None:
+    """Wait until Healthie SPA hydrates and at least one login field is visible."""
+    selectors = [
+        'input[name="email"]',
+        'input[name="Email"]',
+        'input[type="email"]',
+        'input[id*="email"]',
+        'input[autocomplete="email"]',
+        'input[name="password"]',
+        'input[type="password"]',
+    ]
+    elapsed = 0
+    step_ms = 500
+    while elapsed < timeout_ms:
+        locator = await _first_visible_locator(page, selectors, timeout_ms=250)
+        if locator:
+            return
+        await page.wait_for_timeout(step_ms)
+        elapsed += step_ms
+
+    await _write_login_debug_artifacts(page, "login_form_not_rendered")
+    raise Exception(
+        f"Healthie login form did not render within {timeout_ms}ms (url={page.url})"
+    )
+
+
+def _graphql_search_response_predicate(response) -> bool:
+    req = response.request
+    return (
+        "gethealthie.com/graphql" in response.url
+        and req.method == "POST"
+        and response.ok
+    )
+
+
+async def _react_set_search_value(search_input, value: str) -> None:
+    """Set value and notify React/listeners (fill alone often does not trigger client search)."""
+    await search_input.click()
+    await search_input.fill("")
+    await search_input.fill(value)
+    await search_input.evaluate(
+        """el => {
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }"""
+    )
+
+
+async def _submit_clients_list_search(page: Page, search_input, query: str) -> None:
+    """Drive client search: debounced typing; avoid Enter when the filtered table already shows results.
+
+    Enter can clear the filter or break the SPA state after Healthie has already narrowed to one row.
+    """
+    await _react_set_search_value(search_input, query)
+    await page.wait_for_timeout(2000)
+    cand = await _client_profile_candidates_from_dom(page)
+    if len(cand) >= 1:
+        logger.debug("Client links visible after search input ({}), skipping Enter", len(cand))
+        return
+    try:
+        row = page.get_by_role("row").filter(has_text=query).filter(has_text="Book session").first
+        if await row.is_visible(timeout=800):
+            logger.debug("Filtered client row visible; skipping Enter")
+            return
+    except Exception:
+        pass
+    try:
+        if await page.locator(r"text=/Active clients\s*:\s*[1-9]/").first.is_visible(timeout=500):
+            body = (await page.inner_text("body")).lower()
+            if query.lower() in body:
+                logger.debug("Active client count visible; skipping Enter")
+                return
+    except Exception:
+        pass
+    try:
+        async with page.expect_response(_graphql_search_response_predicate, timeout=8000):
+            await search_input.press("Enter")
+    except Exception as exc:
+        logger.debug("Healthie graphql expect around client search Enter: {}", exc)
+    await page.wait_for_timeout(700)
+
+
+def _filter_candidates_by_name(candidates: list[dict], name: str) -> list[dict]:
+    """Prefer links whose row or autocomplete panel mentions the patient (not just link label).
+
+    Dropdown uses anchors like 'View Profile'; name and DOB live in parent context.
+    """
+    if not candidates:
+        return []
+    nl = " ".join(name.lower().split())
+    parts = [p for p in nl.split() if len(p) > 1]
+    rows: list[dict] = []
+    for c in candidates:
+        blob = ((c.get("context") or "") + " " + (c.get("text") or "")).lower().strip()
+        if not blob:
+            continue
+        if nl in blob or (parts and all(p in blob for p in parts)):
+            rows.append(c)
+    return rows if rows else candidates
+
+
+def _score_client_candidate(c: dict, name: str, dob_variants: list[str]) -> int:
+    """Higher score = better match for autocomplete + table rows."""
+    blob = ((c.get("context") or "") + " " + (c.get("text") or "")).lower()
+    nl = " ".join(name.lower().split())
+    score = 0
+    if nl in blob:
+        score += 20
+    for p in nl.split():
+        if len(p) > 2 and p in blob:
+            score += 5
+    for dv in dob_variants:
+        if dv and dv in blob:
+            score += 30
+    return score
+
+
+def _sort_candidates_by_match(candidates: list[dict], name: str, dob_variants: list[str]) -> list[dict]:
+    return sorted(
+        candidates,
+        key=lambda c: (-_score_client_candidate(c, name, dob_variants), c.get("id", "")),
+    )
+
+
+async def _fallback_search_by_keystrokes(page: Page, search_input, query: str) -> None:
+    """If filter still empty, re-enter query slowly (some controlled inputs ignore fill())."""
+    await search_input.click()
+    await search_input.fill("")
+    await search_input.press_sequentially(query, delay=45)
+    await search_input.evaluate(
+        """el => {
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }"""
+    )
+    await page.wait_for_timeout(2000)
+    cand = await _client_profile_candidates_from_dom(page)
+    if len(cand) >= 1:
+        return
+    try:
+        row = page.get_by_role("row").filter(has_text=query).filter(has_text="Book session").first
+        if await row.is_visible(timeout=600):
+            return
+    except Exception:
+        pass
+    try:
+        async with page.expect_response(_graphql_search_response_predicate, timeout=8000):
+            await search_input.press("Enter")
+    except Exception:
+        pass
+    await page.wait_for_timeout(800)
+
+
+async def _wait_for_clients_search_input(
+    page: Page,
+    selectors: list[str],
+    timeout_ms: int = 45000,
+):
+    """Wait until the clients list search field is visible (SPA may mount it after #root).
+
+    Selectors are tried in order. A single comma-joined locator would pick the first
+    match in DOM order (often a header/global field), not the clients table filter.
+    """
+    scoped = [
+        '[role="main"] input[placeholder*="Search"]',
+        '[role="main"] input[placeholder*="Client"]',
+        '[role="main"] input[placeholder*="client"]',
+        '[role="main"] input[type="search"]',
+        'main input[placeholder*="Search"]',
+        'main input[placeholder*="Client"]',
+        'main input[placeholder*="client"]',
+    ]
+    extras = [
+        'input[placeholder*="Client"]',
+        'input[placeholder*="client"]',
+        'input[placeholder*="Filter"]',
+        'input[placeholder*="filter"]',
+        'input[aria-label*="Client"]',
+        'input[aria-label*="client"]',
+        'textarea[placeholder*="Search"]',
+    ]
+    late = [
+        'header input[type="text"]',
+        '[role="combobox"] input',
+    ]
+    primary = list(
+        dict.fromkeys(scoped + selectors + [e for e in extras if e not in late])
+    )
+    ordered = primary + [s for s in late if s not in primary]
+
+    for attempt in range(2):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            for sel in ordered:
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms < 400:
+                    break
+                loc = page.locator(sel).first
+                try:
+                    await loc.wait_for(
+                        state="visible",
+                        timeout=min(8000, remaining_ms),
+                    )
+                    return loc
+                except Exception:
+                    continue
+            await page.wait_for_timeout(350)
+        if attempt == 0:
+            logger.warning("Reloading /clients and retrying search input wait")
+            await page.reload(wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("load", timeout=15000)
+            except Exception:
+                pass
+            await _ensure_page_hydrated(page, timeout_ms=25000, reason="clients_reload_not_hydrated")
+            await _wait_until_clients_page_ready(page, timeout_ms=20000)
+
+    return None
+
+
+async def _wait_until_clients_page_ready(page: Page, timeout_ms: int = 25000) -> None:
+    """Wait until Healthie's full-page spinner (#loading-state-container) is gone.
+
+    Used on /clients list and on /clients/{id} profile — both show the same overlay while hydrating.
+    """
+    elapsed = 0
+    step_ms = 500
+    while elapsed < timeout_ms:
+        loading_indicator = page.locator("#loading-state-container")
+        try:
+            visible = await loading_indicator.is_visible(timeout=200)
+        except Exception:
+            visible = False
+        if not visible:
+            return
+        await page.wait_for_timeout(step_ms)
+        elapsed += step_ms
+
+    await _write_login_debug_artifacts(page, "clients_page_stuck_loading")
+    raise Exception(f"Clients page did not finish loading within {timeout_ms}ms (url={page.url})")
+
+
+async def _wait_for_client_results(
+    page: Page, timeout_ms: int = 25000, patient_name: str | None = None
+) -> None:
+    """Wait for autocomplete, table row, or client links after search."""
+    elapsed = 0
+    step_ms = 350
+    while elapsed < timeout_ms:
+        cand = await _client_profile_candidates_from_dom(page)
+        if len(cand) >= 1:
+            return
+        if patient_name:
+            try:
+                r = page.get_by_role("row").filter(has_text=patient_name).filter(has_text="Book session").first
+                if await r.is_visible(timeout=200):
+                    return
+            except Exception:
+                pass
+            try:
+                r2 = page.get_by_role("row").filter(has_text=patient_name).first
+                if await r2.is_visible(timeout=200):
+                    return
+            except Exception:
+                pass
+            try:
+                if await page.locator(r"text=/Active clients\s*:\s*[1-9]/").first.is_visible(timeout=200):
+                    body = (await page.inner_text("body")).lower()
+                    if patient_name.lower() in body:
+                        return
+            except Exception:
+                pass
+        try:
+            vp = page.get_by_role("link", name="View Profile").first
+            if await vp.is_visible(timeout=200):
+                return
+        except Exception:
+            pass
+        try:
+            opt = page.locator('[role="listbox"] [role="option"], [role="menu"] [role="menuitem"]').first
+            if await opt.is_visible(timeout=200):
+                return
+        except Exception:
+            pass
+        await page.wait_for_timeout(step_ms)
+        elapsed += step_ms
+
+
+async def _ensure_page_hydrated(
+    page: Page, timeout_ms: int = 30000, reason: str = "page_not_hydrated"
+) -> None:
+    """Ensure SPA JS has hydrated root content; retry once with reload if needed."""
+    for attempt in range(2):
+        elapsed = 0
+        step_ms = 500
+        while elapsed < timeout_ms:
+            is_hydrated = await page.evaluate(
+                """
+                () => {
+                  const root = document.querySelector("#root");
+                  if (!root) return false;
+                  return root.children.length > 0 || (root.textContent || "").trim().length > 0;
+                }
+                """
+            )
+            if is_hydrated:
+                return
+            await page.wait_for_timeout(step_ms)
+            elapsed += step_ms
+
+        if attempt == 0:
+            logger.warning("SPA not hydrated yet on {}, retrying page reload", page.url)
+            await page.reload(wait_until="domcontentloaded")
+
+    await _write_login_debug_artifacts(page, reason)
+    raise Exception(f"SPA did not hydrate after retries (url={page.url})")
+
+
+async def _write_login_debug_artifacts(page: Page, reason: str) -> None:
+    """Persist screenshot and HTML to help diagnose login selector issues."""
+    debug_dir = "tmp/healthie-debug"
+    os.makedirs(debug_dir, exist_ok=True)
+    screenshot_path = os.path.join(debug_dir, f"{reason}.png")
+    html_path = os.path.join(debug_dir, f"{reason}.html")
+    await page.screenshot(path=screenshot_path, full_page=True)
+    content = await page.content()
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    logger.error("Saved Healthie debug artifacts: {} and {}", screenshot_path, html_path)
+
+
+async def _log_visible_clients(page: Page, max_clients: int = 20) -> None:
+    """Log visible client links to aid debugging of search/selectors."""
+    try:
+        client_links = page.locator('a[href*="/clients/"], a[href*="/users/"]')
+        count = await client_links.count()
+        names: list[str] = []
+        for i in range(min(count, max_clients)):
+            text = (await client_links.nth(i).inner_text()).strip()
+            if text and text not in names:
+                names.append(text)
+        logger.info("Visible clients on page ({}): {}", len(names), names)
+    except Exception as exc:
+        logger.warning("Could not log visible clients: {}", exc)
+
+
+def _attach_debug_listeners(page: Page) -> None:
+    """Log browser-side failures that can explain blank SPA screens."""
+    page.on(
+        "console",
+        lambda msg: logger.debug("Healthie console [{}]: {}", msg.type, msg.text),
+    )
+    page.on(
+        "pageerror",
+        lambda err: logger.error("Healthie pageerror: {}", err),
+    )
+    page.on(
+        "requestfailed",
+        lambda req: logger.warning(
+            "Healthie request failed: {} {} ({})",
+            req.method,
+            req.url,
+            req.failure,
+        ),
+    )
