@@ -23,7 +23,7 @@ Interim transcripts were starting a new “user turn” too early and **interrup
 ## `find_patient`
 
 1. Navigate to **Clients**, wait for the full-page loader (`#loading-state-container`) to disappear.
-2. Locate the list search field (ordered selectors scoped to `main` / role=main first).
+2. Locate the list search field as **`[role="main"] form[role="search"] input`** (Healthie’s clients toolbar), with one fallback to a main-area search placeholder.
 3. Set search text with **`_react_set_search_value`** (click, fill, dispatch `input`/`change`) so React’s debounced search runs.
 4. Prefer **not** pressing Enter when rows / “Active clients” already show a match — Enter was breaking SPA state (including treating `/appointments/new` as the literal client name `new`).
 5. Collect profile link candidates from `/users/{id}` and `/clients/{id}` patterns and table context.
@@ -39,6 +39,10 @@ Interim transcripts were starting a new “user turn” too early and **interrup
 6. **Submit** — scroll modal content to the bottom, then **`[data-testid="primaryButton"]` (“Add appointment”)** via Playwright **`force` clicks**, in-page **DOM** activation (pointer + mouse + `click()` + `form.requestSubmit(btn)`), and a **second click after ~480 ms** because the first interaction sometimes commits time formatting before the real submit.
 
 Success is inferred from URL (`/appointments/...`) and body text heuristics (not a dedicated API response).
+
+## Selector scope
+
+Automation is intentionally aligned with **English** `secure.gethealthie.com` (Frontegg email/password + **Log In**, clients `form[role="search"]`, `/users/` profile links, **Book session**, booking modal `data-testid="modal-content"`). Broad multi-locale / multi-selector fallbacks were removed to match the UI we exercised; if your tenant differs (e.g. localized labels), a small targeted fallback is easier to add than maintaining a long generic list.
 
 ## Trade-offs
 

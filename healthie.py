@@ -1,8 +1,8 @@
 """Healthie EHR integration (Playwright).
 
-The Healthie web app is a React SPA: global ``#loading-state-container`` must clear before
-reliable interaction; client search needs ``input``/``change`` events, not only ``fill``;
-the booking modal uses react-datepicker and a dedicated **Appointment type** step before submit.
+Targets **secure.gethealthie.com** (English provider UI): Frontegg email/password then **Log In**,
+clients list ``form[role=search]``, profile links under ``/users/{id}``, **Book session**, and the
+book-session modal (``data-testid="modal-content"``, react-datepicker, ``primaryButton``).
 """
 
 import calendar
@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 
 from loguru import logger
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import Browser, BrowserContext, Locator, Page, async_playwright
 
 _browser: Browser | None = None
 _context: BrowserContext | None = None
@@ -69,45 +69,45 @@ async def login_to_healthie() -> Page:
     await _wait_for_login_form(_page, timeout_ms=30000)
     logger.info("Healthie login page loaded: {}", _page.url)
 
-    email_input = await _first_visible_locator(
+    # Frontegg often uses name="email" with type="text", not type="email".
+    email_input = await _healthie_visible_login_field(
         _page,
         [
+            'input[type="email"]',
             'input[name="email"]',
             'input[name="Email"]',
-            'input[type="email"]',
-            'input[id*="email"]',
             'input[autocomplete="email"]',
+            'input[autocomplete="username"]',
         ],
-        timeout_ms=4000,
+        "email",
+        timeout_ms=20000,
     )
-    if not email_input:
-        raise Exception(f"Could not find email input on Healthie login page ({_page.url})")
+    await email_input.click()
+    await email_input.fill("")
     await email_input.fill(email)
+    await email_input.evaluate(
+        """el => {
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }"""
+    )
 
-    # Some Healthie/Frontegg tenants use a 2-step login:
-    # email step first, then password appears after continue.
-    password_input = await _get_password_input(_page, timeout_ms=1500)
-    if not password_input:
+    password_input = _page.locator('input[type="password"]').first
+    try:
+        await password_input.wait_for(state="visible", timeout=2000)
+    except Exception:
         await _submit_email_step(_page)
-        password_input = await _get_password_input(_page, timeout_ms=12000)
-    if not password_input:
-        raise Exception(f"Could not find password input on Healthie login page ({_page.url})")
+        await password_input.wait_for(state="visible", timeout=12000)
     await password_input.fill(password)
 
-    submit_button = await _first_visible_locator(
-        _page,
-        [
-            'button:has-text("Log In")',
-            'button:has-text("Sign In")',
-            'button[type="submit"]',
-            'input[type="submit"]',
-            '[role="button"]:has-text("Log In")',
-        ],
-        timeout_ms=4000,
-    )
-    if not submit_button:
-        raise Exception(f"Could not find login submit button ({_page.url})")
-    await submit_button.click()
+    try:
+        login_btn = _page.get_by_role("button", name="Log In").first
+        await login_btn.wait_for(state="visible", timeout=8000)
+        await login_btn.click()
+    except Exception:
+        sub = _page.locator('form button[type="submit"]').first
+        await sub.wait_for(state="visible", timeout=5000)
+        await sub.click()
 
     await _page.wait_for_timeout(3500)
     await _page.wait_for_load_state("domcontentloaded")
@@ -146,14 +146,6 @@ async def find_patient(name: str, date_of_birth: str) -> dict | None:
     dob_variants = _date_variants(normalized_dob or date_of_birth)
 
     try:
-        search_selectors = [
-            'input[placeholder*="Search"]',
-            'input[aria-label*="Search"]',
-            'input[name*="search"]',
-            "input[type='search']",
-            "[role='searchbox']",
-            "input[data-testid*='search']",
-        ]
         await page.goto("https://secure.gethealthie.com/clients", wait_until="domcontentloaded")
         try:
             await page.wait_for_load_state("load", timeout=15000)
@@ -161,7 +153,7 @@ async def find_patient(name: str, date_of_birth: str) -> dict | None:
             pass
         await _ensure_page_hydrated(page, timeout_ms=30000, reason="clients_page_not_hydrated")
         await _wait_until_clients_page_ready(page, timeout_ms=25000)
-        search_input = await _wait_for_clients_search_input(page, search_selectors)
+        search_input = await _wait_for_clients_search_input(page)
         if search_input:
             logger.info("Found patient search input on {}", page.url)
 
@@ -263,20 +255,14 @@ async def _open_book_session_modal(page: Page, patient_id: str) -> bool:
                 return True
         except Exception:
             pass
-        btn = await _first_visible_locator(
-            page,
-            [
-                'button:has-text("Book session")',
-                'button:has-text("Book Session")',
-                'button:has-text("Create appointment")',
-                'button:has-text("Create Appointment")',
-            ],
-            timeout_ms=1200,
-        )
-        if btn:
-            await btn.scroll_into_view_if_needed()
-            await btn.click()
-            return True
+        try:
+            alt = page.get_by_role("button", name=re.compile(r"^book session$", re.I)).first
+            if await alt.is_visible(timeout=1200):
+                await alt.scroll_into_view_if_needed()
+                await alt.click()
+                return True
+        except Exception:
+            pass
         await page.wait_for_timeout(450)
     return False
 
@@ -286,17 +272,13 @@ HEALTHIE_OPTION_FOLLOW_UP = "Follow-up Session - 45 Minutes"
 
 
 def _healthie_booking_type_option_label(appointment_type: str | None) -> str:
-    """Map caller intent to the exact Healthie dropdown label."""
+    """Map tool enum / phrases to Healthie's exact option labels."""
     if not appointment_type or not str(appointment_type).strip():
         return HEALTHIE_OPTION_INITIAL
-    t = str(appointment_type).strip().lower()
-    if "follow" in t or "45" in t:
+    t = str(appointment_type).strip().lower().replace("-", "_")
+    if t in ("follow_up", "followup") or "follow" in t:
         return HEALTHIE_OPTION_FOLLOW_UP
-    if "initial" in t or "consult" in t or "60" in t:
-        return HEALTHIE_OPTION_INITIAL
-    if t in ("follow_up", "followup", "follow-up"):
-        return HEALTHIE_OPTION_FOLLOW_UP
-    if t in ("initial_consultation", "initial", "consultation"):
+    if t in ("initial_consultation", "initial", "consultation") or "initial" in t:
         return HEALTHIE_OPTION_INITIAL
     return HEALTHIE_OPTION_INITIAL
 
@@ -310,35 +292,6 @@ async def _select_healthie_appointment_type(page: Page, modal, appointment_type:
             combo = None
     except Exception:
         combo = None
-
-    if combo is None:
-        n = await modal.get_by_role("combobox").count()
-        for i in range(n):
-            el = modal.get_by_role("combobox").nth(i)
-            try:
-                aria = (await el.get_attribute("aria-label")) or ""
-                name = (await el.get_attribute("name")) or ""
-                blob = f"{aria} {name}".lower()
-                if "appointment" in blob and "type" in blob:
-                    combo = el
-                    break
-            except Exception:
-                continue
-
-    if combo is None:
-        n = await modal.get_by_role("combobox").count()
-        for i in range(n):
-            el = modal.get_by_role("combobox").nth(i)
-            try:
-                inner = (await el.inner_text()).strip().lower()
-                if "select" not in inner:
-                    continue
-                if "time" in inner or "zone" in inner:
-                    continue
-                combo = el
-                break
-            except Exception:
-                continue
 
     if combo is None:
         return False
@@ -364,24 +317,6 @@ async def _select_healthie_appointment_type(page: Page, modal, appointment_type:
         return True
     except Exception:
         return False
-
-
-async def _fill_modal_field(modal, locator, value: str, *, force: bool = False) -> bool:
-    try:
-        if await locator.is_visible(timeout=2000):
-            await locator.click(force=force)
-            await locator.fill("", force=force)
-            await locator.fill(value, force=force)
-            await locator.evaluate(
-                """el => {
-                  el.dispatchEvent(new Event("input", { bubbles: true }));
-                  el.dispatchEvent(new Event("change", { bubbles: true }));
-                }"""
-            )
-            return True
-    except Exception:
-        pass
-    return False
 
 
 async def _dismiss_healthie_datepicker_overlays(page: Page) -> None:
@@ -604,13 +539,8 @@ async def _click_healthie_modal_submit(modal, page: Page) -> bool:
     await page.wait_for_timeout(250)
 
     candidates = [
-        page.locator('[data-testid="modal"] [data-testid="primaryButton"]').first,
-        page.locator('[data-testid="modal-content"] [data-testid="primaryButton"]').first,
         modal.get_by_test_id("primaryButton").first,
-        modal.locator('button[data-testid="primaryButton"]').first,
-        modal.get_by_role("button", name=re.compile(r"add\s*appointment", re.I)).first,
-        modal.locator('button:has-text("Add appointment")').first,
-        page.locator(".client-book-session-modal button[data-testid='primaryButton']").first,
+        page.locator('[data-testid="modal-content"] [data-testid="primaryButton"]').first,
     ]
 
     async def _try_playwright_click(loc) -> bool:
@@ -674,29 +604,6 @@ async def _click_healthie_modal_submit(modal, page: Page) -> bool:
     try:
         ok = await page.evaluate(
             _legacy_click.strip().replace("__GAP_MS__", str(_ADD_APPOINTMENT_DOUBLE_GAP_MS))
-        )
-        if ok:
-            return True
-    except Exception:
-        pass
-
-    try:
-        ok = await modal.evaluate(
-            (
-                """async (root) => {
-              const btn = root.querySelector('[data-testid="primaryButton"]');
-              if (!btn || btn.disabled) return false;
-              const gap = __GAP_MS__;
-              const once = () => {
-                btn.scrollIntoView({ block: 'center', behavior: 'instant' });
-                btn.click();
-              };
-              once();
-              await new Promise((r) => setTimeout(r, gap));
-              once();
-              return true;
-            }"""
-            ).replace("__GAP_MS__", str(_ADD_APPOINTMENT_DOUBLE_GAP_MS))
         )
         if ok:
             return True
@@ -774,68 +681,14 @@ async def create_appointment(
         try:
             await modal.wait_for(state="visible", timeout=15000)
         except Exception:
-            modal = page.locator('[role="dialog"]').first
-            try:
-                await modal.wait_for(state="visible", timeout=8000)
-            except Exception:
-                logger.error("Booking modal did not appear")
-                return None
+            logger.error("Booking modal did not appear")
+            return None
 
         if not await _select_healthie_appointment_type(page, modal, appointment_type):
             logger.error("Could not set Appointment type in booking modal")
             return None
 
         filled_date, filled_time = await _fill_healthie_booking_datetime(modal, page, display_date, time)
-
-        if not filled_date:
-            for label in (
-                re.compile(r"start\s*date", re.I),
-                re.compile(r"fecha\s*de\s*inicio", re.I),
-            ):
-                if await _fill_modal_field(
-                    modal,
-                    modal.get_by_role("textbox", name=label).first,
-                    display_date,
-                ):
-                    filled_date = True
-                    break
-        if not filled_date:
-            for sel in (
-                'input[placeholder*="Start date"]',
-                'input[placeholder*="start date"]',
-                'input[placeholder*="Date"]',
-            ):
-                loc = modal.locator(sel).first
-                if await _fill_modal_field(modal, loc, display_date):
-                    filled_date = True
-                    break
-
-        if not filled_time:
-            await _dismiss_healthie_datepicker_overlays(page)
-            await page.wait_for_timeout(200)
-            for label in (
-                re.compile(r"start\s*time", re.I),
-                re.compile(r"hora\s*de\s*inicio", re.I),
-            ):
-                if await _fill_modal_field(
-                    modal,
-                    modal.get_by_role("textbox", name=label).first,
-                    time,
-                    force=True,
-                ):
-                    filled_time = True
-                    break
-        if not filled_time:
-            for sel in (
-                'input[placeholder*="Start time"]',
-                'input[placeholder*="start time"]',
-                'input[placeholder*="Time"]',
-                'input[placeholder*="Select a time"]',
-            ):
-                loc = modal.locator(sel).first
-                if await _fill_modal_field(modal, loc, time, force=True):
-                    filled_time = True
-                    break
 
         if not filled_date or not filled_time:
             logger.error("Could not fill booking modal date/time fields")
@@ -847,7 +700,7 @@ async def create_appointment(
         if not await _click_healthie_modal_submit(modal, page):
             await _scroll_healthie_booking_modal_to_bottom(modal)
             clicked = False
-            for txt in ("Add appointment", "Schedule", "Save", "Create", "Confirm", "Book"):
+            for txt in ("Add appointment",):
                 loc = modal.locator(f'button:has-text("{txt}")').first
                 try:
                     await loc.wait_for(state="attached", timeout=2000)
@@ -901,10 +754,8 @@ async def create_appointment(
             for success in (
                 "appointment",
                 "scheduled",
-                "success",
                 "created",
                 "confirmed",
-                "cita",
             )
         ):
             logger.info("Appointment created for patient {}", patient_id)
@@ -975,24 +826,6 @@ def _date_variants(raw: str) -> list[str]:
         sa = calendar.month_abbr[parsed.month].lower()
         variants.add(f"{parsed.day} {sm} {parsed.year}".lower())
         variants.add(f"{parsed.day} {sa} {parsed.year}".lower())
-        # Spanish UI (Healthie may render es-* locale)
-        es_months = (
-            "enero",
-            "febrero",
-            "marzo",
-            "abril",
-            "mayo",
-            "junio",
-            "julio",
-            "agosto",
-            "septiembre",
-            "octubre",
-            "noviembre",
-            "diciembre",
-        )
-        em = es_months[parsed.month - 1]
-        variants.add(f"{parsed.day} de {em} de {parsed.year}".lower())
-        variants.add(f"{parsed.day} de {em}".lower())
     except ValueError:
         pass
     return [v for v in variants if v]
@@ -1171,91 +1004,71 @@ def _absolute_healthie_href(href: str) -> str:
     return f"https://secure.gethealthie.com{path}"
 
 
-async def _first_visible_locator(page: Page, selectors: list[str], timeout_ms: int = 1500):
-    """Return the first visible locator from a list of selector candidates."""
-    for selector in selectors:
-        locator = page.locator(selector).first
-        try:
-            if await locator.is_visible(timeout=timeout_ms):
-                return locator
-        except Exception:
-            continue
-    return None
-
-
-async def _get_password_input(page: Page, timeout_ms: int = 4000):
-    """Find a visible password field on the current page."""
-    return await _first_visible_locator(
-        page,
-        [
-            'input[name="password"]',
-            'input[type="password"]',
-            'input[id*="password"]',
-            'input[autocomplete="current-password"]',
-        ],
-        timeout_ms=timeout_ms,
-    )
+async def _healthie_visible_login_field(
+    page: Page, selectors: list[str], purpose: str, *, timeout_ms: int
+) -> Locator:
+    """Return the first **visible** input matching any selector (Frontegg varies type vs name)."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    last: BaseException | None = None
+    while time.monotonic() < deadline:
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                await loc.wait_for(state="visible", timeout=600)
+                return loc
+            except Exception as exc:
+                last = exc
+                continue
+        await page.wait_for_timeout(150)
+    err = Exception(f"Could not find visible {purpose} field on {page.url}")
+    if isinstance(last, BaseException):
+        raise err from last
+    raise err
 
 
 async def _submit_email_step(page: Page) -> None:
-    """Advance 2-step login flows where password appears after email submission."""
-    continue_button = await _first_visible_locator(
-        page,
-        [
-            'button:has-text("Continue")',
-            'button:has-text("Next")',
-            'button:has-text("Log In")',
-            'button:has-text("Sign In")',
-            'button[type="submit"]',
-            'input[type="submit"]',
-            '[role="button"]:has-text("Continue")',
-            '[role="button"]:has-text("Next")',
-        ],
-        timeout_ms=2000,
-    )
-    if continue_button:
-        await continue_button.click()
-    else:
-        # Fallback for forms that submit on Enter from email field.
-        email_input = await _first_visible_locator(
+    """Frontegg-style step: continue after email before password field appears."""
+    for label in ("Continue", "Next"):
+        btn = page.get_by_role("button", name=label).first
+        try:
+            if await btn.is_visible(timeout=1500):
+                await btn.click()
+                await page.wait_for_timeout(700)
+                return
+        except Exception:
+            continue
+    try:
+        email_loc = await _healthie_visible_login_field(
             page,
             [
+                'input[type="email"]',
                 'input[name="email"]',
                 'input[name="Email"]',
-                'input[type="email"]',
-                'input[id*="email"]',
                 'input[autocomplete="email"]',
             ],
-            timeout_ms=1000,
+            "email",
+            timeout_ms=5000,
         )
-        if email_input:
-            await email_input.press("Enter")
-
+        await email_loc.press("Enter")
+    except Exception:
+        pass
     await page.wait_for_timeout(700)
 
 
 async def _wait_for_login_form(page: Page, timeout_ms: int = 30000) -> None:
-    """Wait until Healthie SPA hydrates and at least one login field is visible."""
-    selectors = [
-        'input[name="email"]',
-        'input[name="Email"]',
-        'input[type="email"]',
-        'input[id*="email"]',
-        'input[autocomplete="email"]',
-        'input[name="password"]',
-        'input[type="password"]',
-    ]
-    elapsed = 0
-    step_ms = 500
-    while elapsed < timeout_ms:
-        locator = await _first_visible_locator(page, selectors, timeout_ms=250)
-        if locator:
-            return
-        await page.wait_for_timeout(step_ms)
-        elapsed += step_ms
-
-    raise Exception(
-        f"Healthie login form did not render within {timeout_ms}ms (url={page.url})"
+    """Wait until Frontegg shows an email or password field (``type=email`` alone is not enough)."""
+    await _healthie_visible_login_field(
+        page,
+        [
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[name="Email"]',
+            'input[autocomplete="email"]',
+            'input[autocomplete="username"]',
+            'input[type="password"]',
+        ],
+        "login",
+        timeout_ms=timeout_ms,
     )
 
 
@@ -1385,40 +1198,14 @@ async def _fallback_search_by_keystrokes(page: Page, search_input, query: str) -
 
 async def _wait_for_clients_search_input(
     page: Page,
-    selectors: list[str],
     timeout_ms: int = 45000,
 ):
-    """Wait until the clients list search field is visible (SPA may mount it after #root).
-
-    Selectors are tried in order. A single comma-joined locator would pick the first
-    match in DOM order (often a header/global field), not the clients table filter.
-    """
-    scoped = [
+    """Wait for the clients table search field (Healthie: ``form[role=search]`` in main)."""
+    ordered = [
+        '[role="main"] form[role="search"] input',
+        'form[role="search"] input',
         '[role="main"] input[placeholder*="Search"]',
-        '[role="main"] input[placeholder*="Client"]',
-        '[role="main"] input[placeholder*="client"]',
-        '[role="main"] input[type="search"]',
-        'main input[placeholder*="Search"]',
-        'main input[placeholder*="Client"]',
-        'main input[placeholder*="client"]',
     ]
-    extras = [
-        'input[placeholder*="Client"]',
-        'input[placeholder*="client"]',
-        'input[placeholder*="Filter"]',
-        'input[placeholder*="filter"]',
-        'input[aria-label*="Client"]',
-        'input[aria-label*="client"]',
-        'textarea[placeholder*="Search"]',
-    ]
-    late = [
-        'header input[type="text"]',
-        '[role="combobox"] input',
-    ]
-    primary = list(
-        dict.fromkeys(scoped + selectors + [e for e in extras if e not in late])
-    )
-    ordered = primary + [s for s in late if s not in primary]
 
     for attempt in range(2):
         deadline = time.monotonic() + timeout_ms / 1000
