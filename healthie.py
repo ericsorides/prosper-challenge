@@ -1,7 +1,8 @@
-"""Healthie EHR integration module.
+"""Healthie EHR integration (Playwright).
 
-This module provides functions to interact with Healthie for patient management
-and appointment scheduling.
+The Healthie web app is a React SPA: global ``#loading-state-container`` must clear before
+reliable interaction; client search needs ``input``/``change`` events, not only ``fill``;
+the booking modal uses react-datepicker and a dedicated **Appointment type** step before submit.
 """
 
 import calendar
@@ -61,7 +62,6 @@ async def login_to_healthie() -> Page:
     _browser = await playwright.chromium.launch(headless=headless)
     _context = await _browser.new_context()
     _page = await _context.new_page()
-    _attach_debug_listeners(_page)
 
     await _page.goto("https://secure.gethealthie.com/users/sign_in", wait_until="domcontentloaded")
     # Healthie's auth UI is a SPA and can take several seconds to hydrate.
@@ -81,7 +81,6 @@ async def login_to_healthie() -> Page:
         timeout_ms=4000,
     )
     if not email_input:
-        await _write_login_debug_artifacts(_page, "email_input_not_found")
         raise Exception(f"Could not find email input on Healthie login page ({_page.url})")
     await email_input.fill(email)
 
@@ -92,7 +91,6 @@ async def login_to_healthie() -> Page:
         await _submit_email_step(_page)
         password_input = await _get_password_input(_page, timeout_ms=12000)
     if not password_input:
-        await _write_login_debug_artifacts(_page, "password_input_not_found")
         raise Exception(f"Could not find password input on Healthie login page ({_page.url})")
     await password_input.fill(password)
 
@@ -108,7 +106,6 @@ async def login_to_healthie() -> Page:
         timeout_ms=4000,
     )
     if not submit_button:
-        await _write_login_debug_artifacts(_page, "submit_button_not_found")
         raise Exception(f"Could not find login submit button ({_page.url})")
     await submit_button.click()
 
@@ -116,7 +113,6 @@ async def login_to_healthie() -> Page:
     await _page.wait_for_load_state("domcontentloaded")
     current_url = _page.url
     if "login" in current_url or "sign_in" in current_url:
-        await _write_login_debug_artifacts(_page, "still_on_login_page")
         raise Exception(f"Login may have failed; still on auth page ({current_url})")
 
     logger.info("Successfully logged into Healthie")
@@ -170,8 +166,6 @@ async def find_patient(name: str, date_of_birth: str) -> dict | None:
             logger.info("Found patient search input on {}", page.url)
 
         if not search_input:
-            await _log_visible_clients(page)
-            await _write_login_debug_artifacts(page, "patient_search_input_not_found")
             logger.error("Could not locate patient search input on {}", page.url)
             return None
 
@@ -186,14 +180,11 @@ async def find_patient(name: str, date_of_birth: str) -> dict | None:
             candidates = await _collect_client_candidates(page, normalized_name)
 
         if len(candidates) < 1:
-            await _log_visible_clients(page)
-            await _write_login_debug_artifacts(page, "client_rows_not_found_after_search")
             logger.info("No patient rows found for name '{}'", normalized_name)
             return None
 
         candidates = _filter_candidates_by_name(candidates, normalized_name)
         candidates = _sort_candidates_by_match(candidates, normalized_name, dob_variants)
-        logger.debug("Client profile candidates after search: {}", candidates)
 
         sole_list_match = (
             len(candidates) == 1
@@ -224,12 +215,6 @@ async def find_patient(name: str, date_of_birth: str) -> dict | None:
                 await page.wait_for_timeout(1500)
                 page_text = await page.inner_text("body")
                 body = _profile_body_normalized(page_text)
-                logger.debug(
-                    "Evaluating client candidate '{}' ({}) on {} (DOB variants + flex)",
-                    text or normalized_name,
-                    patient_id,
-                    purl,
-                )
                 if _dob_matches_profile_body(body, dob_variants, normalized_dob):
                     logger.info("Found matching patient '{}' ({})", text or normalized_name, patient_id)
                     return {
@@ -601,8 +586,6 @@ async def _click_add_appointment_via_dom(page: Page) -> bool:
         result = await page.evaluate(_dom_script.strip().replace("__GAP_MS__", _gap))
         if isinstance(result, dict) and result.get("ok"):
             return True
-        if isinstance(result, dict) and result.get("reason"):
-            logger.warning("DOM Add appointment did not run: {}", result.get("reason"))
         return False
     except Exception:
         return False
@@ -784,7 +767,6 @@ async def create_appointment(
         await page.wait_for_timeout(800)
 
         if not await _open_book_session_modal(page, patient_id):
-            await _write_login_debug_artifacts(page, "appointment_book_button_not_found")
             logger.error("Could not open Book session for patient {}", patient_id)
             return None
 
@@ -796,13 +778,11 @@ async def create_appointment(
             try:
                 await modal.wait_for(state="visible", timeout=8000)
             except Exception:
-                await _write_login_debug_artifacts(page, "appointment_modal_not_visible")
                 logger.error("Booking modal did not appear")
                 return None
 
         if not await _select_healthie_appointment_type(page, modal, appointment_type):
             logger.error("Could not set Appointment type in booking modal")
-            await _write_login_debug_artifacts(page, "appointment_type_not_selected")
             return None
 
         filled_date, filled_time = await _fill_healthie_booking_datetime(modal, page, display_date, time)
@@ -858,7 +838,6 @@ async def create_appointment(
                     break
 
         if not filled_date or not filled_time:
-            await _write_login_debug_artifacts(page, "appointment_modal_fields_not_found")
             logger.error("Could not fill booking modal date/time fields")
             return None
 
@@ -906,7 +885,6 @@ async def create_appointment(
                 except Exception:
                     continue
             if not clicked:
-                await _write_login_debug_artifacts(page, "appointment_submit_not_found")
                 logger.error("Could not click Add appointment / submit in booking modal")
                 return None
 
@@ -938,7 +916,6 @@ async def create_appointment(
                 "status": "scheduled",
             }
 
-        await _write_login_debug_artifacts(page, "appointment_verify_failed")
         logger.error("Could not verify appointment creation")
         return None
     except Exception as exc:
@@ -1277,7 +1254,6 @@ async def _wait_for_login_form(page: Page, timeout_ms: int = 30000) -> None:
         await page.wait_for_timeout(step_ms)
         elapsed += step_ms
 
-    await _write_login_debug_artifacts(page, "login_form_not_rendered")
     raise Exception(
         f"Healthie login form did not render within {timeout_ms}ms (url={page.url})"
     )
@@ -1314,12 +1290,10 @@ async def _submit_clients_list_search(page: Page, search_input, query: str) -> N
     await page.wait_for_timeout(2000)
     cand = await _client_profile_candidates_from_dom(page)
     if len(cand) >= 1:
-        logger.debug("Client links visible after search input ({}), skipping Enter", len(cand))
         return
     try:
         row = page.get_by_role("row").filter(has_text=query).filter(has_text="Book session").first
         if await row.is_visible(timeout=800):
-            logger.debug("Filtered client row visible; skipping Enter")
             return
     except Exception:
         pass
@@ -1327,15 +1301,14 @@ async def _submit_clients_list_search(page: Page, search_input, query: str) -> N
         if await page.locator(r"text=/Active clients\s*:\s*[1-9]/").first.is_visible(timeout=500):
             body = (await page.inner_text("body")).lower()
             if query.lower() in body:
-                logger.debug("Active client count visible; skipping Enter")
                 return
     except Exception:
         pass
     try:
         async with page.expect_response(_graphql_search_response_predicate, timeout=8000):
             await search_input.press("Enter")
-    except Exception as exc:
-        logger.debug("Healthie graphql expect around client search Enter: {}", exc)
+    except Exception:
+        pass
     await page.wait_for_timeout(700)
 
 
@@ -1495,7 +1468,6 @@ async def _wait_until_clients_page_ready(page: Page, timeout_ms: int = 25000) ->
         await page.wait_for_timeout(step_ms)
         elapsed += step_ms
 
-    await _write_login_debug_artifacts(page, "clients_page_stuck_loading")
     raise Exception(f"Clients page did not finish loading within {timeout_ms}ms (url={page.url})")
 
 
@@ -1571,54 +1543,6 @@ async def _ensure_page_hydrated(
             logger.warning("SPA not hydrated yet on {}, retrying page reload", page.url)
             await page.reload(wait_until="domcontentloaded")
 
-    await _write_login_debug_artifacts(page, reason)
     raise Exception(f"SPA did not hydrate after retries (url={page.url})")
 
 
-async def _write_login_debug_artifacts(page: Page, reason: str) -> None:
-    """Persist screenshot and HTML to help diagnose login selector issues."""
-    debug_dir = "tmp/healthie-debug"
-    os.makedirs(debug_dir, exist_ok=True)
-    screenshot_path = os.path.join(debug_dir, f"{reason}.png")
-    html_path = os.path.join(debug_dir, f"{reason}.html")
-    await page.screenshot(path=screenshot_path, full_page=True)
-    content = await page.content()
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    logger.error("Saved Healthie debug artifacts: {} and {}", screenshot_path, html_path)
-
-
-async def _log_visible_clients(page: Page, max_clients: int = 20) -> None:
-    """Log visible client links to aid debugging of search/selectors."""
-    try:
-        client_links = page.locator('a[href*="/clients/"], a[href*="/users/"]')
-        count = await client_links.count()
-        names: list[str] = []
-        for i in range(min(count, max_clients)):
-            text = (await client_links.nth(i).inner_text()).strip()
-            if text and text not in names:
-                names.append(text)
-        logger.info("Visible clients on page ({}): {}", len(names), names)
-    except Exception as exc:
-        logger.warning("Could not log visible clients: {}", exc)
-
-
-def _attach_debug_listeners(page: Page) -> None:
-    """Log browser-side failures that can explain blank SPA screens."""
-    page.on(
-        "console",
-        lambda msg: logger.debug("Healthie console [{}]: {}", msg.type, msg.text),
-    )
-    page.on(
-        "pageerror",
-        lambda err: logger.error("Healthie pageerror: {}", err),
-    )
-    page.on(
-        "requestfailed",
-        lambda req: logger.warning(
-            "Healthie request failed: {} {} ({})",
-            req.method,
-            req.url,
-            req.failure,
-        ),
-    )

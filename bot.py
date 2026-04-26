@@ -4,18 +4,9 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Pipecat Quickstart Example.
+"""Prosper Health voice scheduling bot (Pipecat + ElevenLabs + OpenAI + Healthie tools).
 
-The example runs a simple voice AI bot that you can connect to using your
-browser and speak with it. You can also deploy this bot to Pipecat Cloud.
-
-Required AI services:
-- ElevenLabs (Speech-to-Text and Text-to-Speech)
-- OpenAI (LLM)
-
-Run the bot using::
-
-    uv run bot.py
+Run: ``uv run bot.py`` — then open the local URL and connect.
 """
 
 import os
@@ -24,8 +15,7 @@ from dotenv import load_dotenv
 from loguru import logger
 from healthie import create_appointment, find_patient, login_to_healthie
 
-print("🚀 Starting Pipecat bot...")
-print("⏳ Loading models and imports (20 seconds, first run only)\n")
+print("Starting Pipecat bot (first run may take ~20s while models load)…\n")
 
 logger.info("Loading Local Smart Turn Analyzer V3...")
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3

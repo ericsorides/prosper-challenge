@@ -1,77 +1,60 @@
-# Solution Overview
+# Solution overview
 
-I implemented the missing pieces required to make the scheduling bot functional:
+This fork completes the [Prosper challenge](https://github.com/Prosper-Technologies/prosper-challenge): a voice agent collects caller details, looks up the patient in **Healthie** (EHR), and books an appointment via **Playwright** browser automation.
 
-1. Added conversation flow instructions so the assistant:
-   - asks for patient full name and date of birth,
-   - finds the patient in Healthie,
-   - asks for appointment date and time,
-   - creates the appointment and confirms the result.
-2. Implemented `find_patient(name, date_of_birth)` in `healthie.py`.
-3. Implemented `create_appointment(patient_id, date, time)` in `healthie.py`.
-4. Integrated these functions into Pipecat function calling in `bot.py`.
+## Deliverables vs README
 
-## What I Changed
+| README expectation | Implementation |
+|-------------------|----------------|
+| Conversation: name, DOB, then date & time | **Plus** visit type: `initial_consultation` (60 min) or `follow_up` (45 min), required by Healthie’s booking modal. |
+| `find_patient(name, date_of_birth)` | `healthie.find_patient` — clients list search, profile navigation, DOB verification with format variants. |
+| `create_appointment(patient_id, date, time)` | Extended to **`create_appointment(patient_id, date, time, appointment_type=None)`**; the voice tool always passes `appointment_type`. |
+| Pipecat integration | `bot.py` registers tools, system prompt enforces flow, **pre-login** on connect to reduce first-tool latency. |
 
-### `bot.py`
+## Architecture
 
-- Added Pipecat function-calling tool schemas using `FunctionSchema` and `ToolsSchema`.
-- Registered two function handlers on the LLM service:
-  - `find_patient`
-  - `create_appointment`
-- Updated system instruction to enforce the required scheduling flow.
-- Updated first greeting prompt to request name and date of birth at conversation start.
-- Added robust handler responses so the LLM can handle:
-  - missing fields,
-  - patient-not-found,
-  - appointment-create failures.
+- **`bot.py`** — Pipecat pipeline (ElevenLabs STT/TTS, OpenAI LLM), `FunctionSchema` tools, handlers that call `healthie` and return structured JSON for the model.
+- **`healthie.py`** — Reused browser session (`login_to_healthie`), Playwright-only automation against `secure.gethealthie.com`.
 
-### `healthie.py`
+### Voice UX (turn-taking)
 
-- Implemented `find_patient`:
-  - logs in to Healthie via existing `login_to_healthie`,
-  - navigates to patients list,
-  - searches by name,
-  - opens candidate patient pages,
-  - validates date of birth from page content when possible,
-  - returns patient payload with `patient_id`.
-- Implemented `create_appointment`:
-  - opens patient page,
-  - tries common "new appointment" entry points,
-  - fills date/time fields with selector fallbacks,
-  - submits form and validates success from URL/content,
-  - returns appointment payload including `appointment_id` when available.
-- Added helper utilities:
-  - `_normalize_date` to convert common date formats to `YYYY-MM-DD`,
-  - `_first_visible_locator` to improve resilience across UI variants.
+Interim transcripts were starting a new “user turn” too early and **interrupting** the LLM mid–tool-call. The bot uses **`UserTurnStrategies`** with **VAD-only start** (`VADUserTurnStartStrategy`) and **`TurnAnalyzerUserTurnStopStrategy`** with slightly longer **`stop_secs`** on Silero VAD so the model can finish `create_appointment` before the next turn.
 
-## Design Decisions and Trade-offs
+## `find_patient`
 
-- **UI automation approach**: I used Playwright browser automation because it matches the starter repository setup and does not require reverse engineering private APIs.
-- **Selector fallback strategy**: Healthie UI selectors can change; I used multiple selector candidates to reduce brittleness.
-- **Best-effort verification**: Patient DOB matching and appointment success validation are implemented using page text/URL checks. This is practical but not as reliable as a formal API response.
-- **Synchronous function calls**: Tool handlers currently wait for Healthie operations to finish before responding, which keeps dialog state simpler.
+1. Navigate to **Clients**, wait for the full-page loader (`#loading-state-container`) to disappear.
+2. Locate the list search field (ordered selectors scoped to `main` / role=main first).
+3. Set search text with **`_react_set_search_value`** (click, fill, dispatch `input`/`change`) so React’s debounced search runs.
+4. Prefer **not** pressing Enter when rows / “Active clients” already show a match — Enter was breaking SPA state (including treating `/appointments/new` as the literal client name `new`).
+5. Collect profile link candidates from `/users/{id}` and `/clients/{id}` patterns and table context.
+6. Open candidate profiles, normalize body text, match DOB with multiple textual formats (and a cautious **sole exact-name** fallback when DOB text is absent).
 
-## Known Limitations
+## `create_appointment`
 
-- Healthie tenant-specific UI differences may require additional selectors.
-- Date of birth verification depends on profile text visibility and may fail in some layouts.
-- Appointment success checks are heuristic (URL/body content) rather than explicit backend confirmation.
+1. Open **`/clients/{patient_id}`**, wait for the same global loader as on the list page.
+2. Open **Book session** from `data-testid="book-session-with-{id}"` or visible **Book session** text (polled).
+3. Scope the modal with **`[data-testid="modal-content"]`** (avoids picking the wrong `role=dialog`, e.g. chat widgets).
+4. **Appointment type** — combobox labeled “Appointment type”; choose **Initial Consultation - 60 Minutes** or **Follow-up Session - 45 Minutes** from the listbox. This step is **required**; booking fails if skipped.
+5. **Date / time** — `input#date` / `input#time`, dismiss react-datepicker poppers with **Escape**, use **`force`** on time when needed; broken `aria-labelledby` on the time field makes role+name matching unreliable, so IDs are primary.
+6. **Submit** — scroll modal content to the bottom, then **`[data-testid="primaryButton"]` (“Add appointment”)** via Playwright **`force` clicks**, in-page **DOM** activation (pointer + mouse + `click()` + `form.requestSubmit(btn)`), and a **second click after ~480 ms** because the first interaction sometimes commits time formatting before the real submit.
 
-## Future Improvements
+Success is inferred from URL (`/appointments/...`) and body text heuristics (not a dedicated API response).
 
-- **Latency**
-  - Reuse a persistent authenticated browser context across calls and pre-load patients pages.
-  - Add explicit progress messaging while tool calls are running.
-- **Reliability**
-  - Add retries with backoff for transient navigation and element timeouts.
-  - Add alternate transport/provider fallbacks (STT/TTS/LLM) when one provider is down.
-  - Add structured error categories so the LLM can recover predictably.
-- **Evaluation**
-  - Add an automated test harness with mocked Playwright pages for tool handlers.
-  - Add transcript-based scenario tests for:
-    - happy path,
-    - patient not found,
-    - invalid date/time,
-    - slot unavailable.
-  - Track metrics for function-call success rate and total booking completion rate.
+## Trade-offs
+
+| Choice | Why | Cost |
+|--------|-----|------|
+| Playwright, not private API | Matches the starter stack; no credential reverse-engineering. | Brittle to UI/CSS changes; slower than API. |
+| Heuristic success / DOB | Practical without backend hooks. | False positives/negatives possible on unusual tenants. |
+| Blocking tool handlers | Simple mental model for the LLM. | Long pauses on slow Healthie loads; user hears silence unless TTS fills the gap. |
+| Single shared browser page | Faster repeat tool calls after first login. | Session expiry or navigation bugs affect all calls until re-login. |
+
+## Future work (latency, reliability, evaluation)
+
+- **Latency** — Long-lived context + tab pool; stream a short “one moment” TTS filler while tools run; parallel pre-fetch of client page when DOB is confirmed.
+- **Reliability** — Classify failures (auth, selector, validation, network); bounded retries; optional headless flag is already **`HEALTHIE_HEADLESS=true`** for servers.
+- **Evaluation** — Recorded Playwright traces for golden paths; contract tests on handler JSON; scripted transcripts (found / not found / slot conflict / double-booking).
+
+## Running locally
+
+See **README.md**: `cp env.example .env`, `uv sync`, `uv run playwright install chromium`, `uv run bot.py`, then open the printed local URL and connect.

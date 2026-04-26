@@ -5,11 +5,10 @@ This is a template repository for an AI voice agent that is able to schedule app
 - Pipecat is configured with sensible defaults and the bot already introduces itself when initialized
 - Playwright is set up so that you can programmatically log into Healthie, the EHR we'll use for this challenge
 
-However, for the agent to be fully functional you'll need to implement the following missig pieces:
+This fork implements the missing pieces:
 
-- Expand the agent's configuration so that it asks for the patient's name and date of birth
-- Once it finds the patient it should ask for the desired date and time of the appointment and create it
-- Implement the find patient and create appointment functionalities using Playwright or otherwise
+- **Conversation** — Collects full name and date of birth, calls **`find_patient`**, then asks for **visit type** (initial 60 min vs follow-up 45 min), **date**, and **time**, and calls **`create_appointment`** with those fields.
+- **`healthie.find_patient`** / **`healthie.create_appointment`** — Playwright automation against the Healthie web app (see **`SOLUTION.md`** for behavior and trade-offs).
 
 ## Setup
 
@@ -50,6 +49,8 @@ You'll need a Healthie account for testing, you can create one [here](https://se
    OPENAI_API_KEY=your_openai_api_key
    HEALTHIE_EMAIL=your_healthie_email
    HEALTHIE_PASSWORD=your_healthie_password
+   # Optional: run Chromium headless (e.g. servers)
+   # HEALTHIE_HEADLESS=true
    ```
 
 3. Set up a virtual environment and install dependencies
@@ -80,15 +81,15 @@ uv run bot.py
 
 To make the agent functional we expect you to implement at least the following missing functionalities:
 
-1. **Conversation Flow**: Modify the agent's behavior to ask for patient name and date of birth, then appointment date and time. [This guide](https://docs.pipecat.ai/guides/learn/function-calling) on function calling from Pipecat is probably a good start.
+1. **Conversation flow** — Implemented in `bot.py` (system prompt + tools); see [Pipecat function calling](https://docs.pipecat.ai/guides/learn/function-calling).
 
-2. **Find Patient**: Implement `healthie.find_patient(name, date_of_birth)` in `healthie.py` to search for patients in Healthie.
+2. **`healthie.find_patient(name, date_of_birth)`** — Implemented in `healthie.py`.
 
-3. **Create Appointment**: Implement `healthie.create_appointment(patient_id, date, time)` in `healthie.py` to create appointments in Healthie.
+3. **`healthie.create_appointment(patient_id, date, time, appointment_type=...)`** — Implemented in `healthie.py`; the voice tool passes **`appointment_type`** (`initial_consultation` or `follow_up`) to match Healthie’s modal.
 
-4. **Integration**: Connect the voice agent to these functions so it can actually schedule appointments during conversations.
+4. **Integration** — Pipecat handlers in `bot.py` call the Healthie helpers during the call.
 
-We encourage you to use AI tools (Claude Code, Cursor, etc.) to help you with this challenge. We don't mind if you "vibe code" everything, that probably means you have good prompting skills. What we do care about is whether you understand the decisions and trade-offs behind your solution. That's why, apart from the code itself, we'd like you to write a high-level overview of your solution and the decisions you've made to get to it—do this in a `SOLUTION.md` file at the root of your fork. During the interview we'll dive deeper into it and discuss opportunities to improve it in the future.
+We encourage you to use AI tools (Claude Code, Cursor, etc.) to help you with this challenge. We don't mind if you "vibe code" everything, that probably means you have good prompting skills. What we do care about is whether you understand the decisions and trade-offs behind your solution. That's why, apart from the code itself, we'd like you to write a high-level overview of your solution and the decisions you've made to get to it—do this in a `SOLUTION.md` file at the root of your fork. **This repository includes `SOLUTION.md` for that overview.** During the interview we'll dive deeper into it and discuss opportunities to improve it in the future.
 
 If you'd like to go further, you can already document some of those potential improvements in your `SOLUTION.md`. Some areas that we'd love to hear your thoughts on are:
 - Latency: balancing speed with user experience and accuracy
